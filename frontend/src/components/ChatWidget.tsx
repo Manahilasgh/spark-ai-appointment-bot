@@ -3,6 +3,7 @@
 import { KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '@/lib/api';
 import type { Appointment, BookingOptions, ChatAction, Draft } from '@/lib/types';
+import { Typewriter } from '@/lib/typewriter';
 import AppointmentForm from './AppointmentForm';
 
 interface Msg {
@@ -10,6 +11,7 @@ interface Msg {
   role: 'user' | 'assistant';
   content: string;
   error?: boolean;
+  streaming?: boolean; // reply is still being written
 }
 
 const SESSION_KEY = 'chat_session_id';
@@ -37,6 +39,7 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [streaming, setStreaming] = useState(false); // true once the first words of a reply have arrived
   const [confirming, setConfirming] = useState(false);
   const [ready, setReady] = useState(false);
   const [action, setAction] = useState<ChatAction>('book');
@@ -86,7 +89,7 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
   }, []);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    bottomRef.current?.scrollIntoView({ behavior: sending ? 'auto' : 'smooth', block: 'end' });
   }, [messages, sending, showForm]);
 
   async function send(text: string) {
@@ -96,16 +99,40 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
     setInput('');
     setSending(true);
     setReady(false);
+
+    const replyId = uid();
+    let started = false;
+    // Incoming text is revealed at a steady pace, so bursty chunks from the provider still read as a stream
+    const typer = new Typewriter((piece) =>
+      setMessages((m) => m.map((x) => (x.id === replyId ? { ...x, content: x.content + piece } : x))),
+    );
+    const appendDelta = (piece: string) => {
+      if (!started) {
+        started = true;
+        setStreaming(true);
+        setMessages((m) => [...m, { id: replyId, role: 'assistant', content: '', streaming: true }]);
+      }
+      typer.push(piece);
+    };
+
     try {
-      const res = await api.sendMessage({ sessionId: sessionId ?? undefined, message: content });
+      const res = await api.streamMessage({ sessionId: sessionId ?? undefined, message: content }, appendDelta);
+      await typer.drain(); // let the reveal finish before swapping in the authoritative text
       setSessionId(res.sessionId);
       window.localStorage.setItem(SESSION_KEY, res.sessionId);
-      addMsg('assistant', res.reply);
+      // The final text is authoritative: validation may have changed what the assistant should say
+      setMessages((m) =>
+        started
+          ? m.map((x) => (x.id === replyId ? { ...x, content: res.reply, streaming: false } : x))
+          : [...m, { id: replyId, role: 'assistant', content: res.reply }],
+      );
       setDraft(res.draft);
       setAction(res.action ?? 'book');
       setReady(res.readyToConfirm);
       if (res.needsForm) setShowForm(true); // fallback: AI down or conversation not converging
     } catch (err) {
+      typer.cancel();
+      setMessages((m) => m.filter((x) => x.id !== replyId)); // drop any half-written reply
       if (err instanceof ApiError && err.code === 'SESSION_CLOSED') {
         resetChat();
         addMsg('assistant', 'That conversation has finished. Please send your request again to start a new one.', true);
@@ -115,6 +142,7 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
       }
     } finally {
       setSending(false);
+      setStreaming(false);
     }
   }
 
@@ -202,9 +230,9 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
         <>
           <div className="chat-body" role="log" aria-live="polite">
             {messages.map((m) => (
-              <div key={m.id} className={`msg ${m.role}${m.error ? ' error' : ''}`}>{m.content}</div>
+              <div key={m.id} className={`msg ${m.role}${m.error ? ' error' : ''}${m.streaming ? ' streaming' : ''}`}>{m.content}</div>
             ))}
-            {sending && (
+            {sending && !streaming && (
               <div className="msg assistant typing" aria-label="Assistant is typing">
                 <span /><span /><span />
               </div>

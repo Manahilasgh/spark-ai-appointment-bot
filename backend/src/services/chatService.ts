@@ -139,7 +139,11 @@ const completeSession = (sessionId: string) =>
 
 // ---------- public API ----------
 
-export async function handleMessage(actor: Actor, input: { sessionId?: string; message: string }) {
+export async function handleMessage(
+  actor: Actor,
+  input: { sessionId?: string; message: string },
+  onDelta?: (text: string) => void, // when set, the AI reply is streamed as it is generated
+) {
   const business = await getBusiness(actor.businessId);
   const tz = business.timezone;
   const session = input.sessionId ? await loadSession(actor, input.sessionId) : await createSession(actor);
@@ -164,7 +168,7 @@ export async function handleMessage(actor: Actor, input: { sessionId?: string; m
       draft,
       appointments: upcoming.map((a, i) => ({ ref: i + 1, label: `${a.service}, ${formatSlot(a.startsAt, tz)}` })),
       history,
-    });
+    }, onDelta);
     draft = applyIntent(draft, ai.intent, ai.appointmentRef, normalizeExtracted(ai.extracted), upcoming);
     reply = ai.reply;
   } catch (err) {

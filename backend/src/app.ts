@@ -9,6 +9,8 @@ import { requestLogger } from './middleware/requestLogger';
 import { appointmentsRouter } from './routes/appointments';
 import { authRouter } from './routes/auth';
 import { chatRouter } from './routes/chat';
+import { adminRouter } from './routes/admin';
+import { staffRouter } from './routes/staff';
 
 export const app = express();
 
@@ -31,6 +33,8 @@ app.use('/api', generalLimiter);
 app.use('/api/auth', authRouter);
 app.use('/api/appointments', appointmentsRouter);
 app.use('/api/chat', chatRouter);
+app.use('/api/staff', staffRouter);
+app.use('/api/admin', adminRouter);
 
 app.use(notFound);
 app.use(errorHandler);

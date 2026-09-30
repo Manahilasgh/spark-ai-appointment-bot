@@ -3,6 +3,7 @@ import { env } from '../config/env';
 import { pool } from '../db/pool';
 import { logger } from '../utils/logger';
 import { BUSINESS_HOURS, SERVICES, todayIn } from './bookingRules';
+import { ReplyExtractor } from './replyExtractor';
 
 /**
  * AI boundary: this module ONLY turns conversation text into structured fields + a reply.
@@ -135,14 +136,71 @@ function parseModelJson(content: string): AiResult {
   return result.data;
 }
 
-export async function extractBooking(input: ExtractInput): Promise<AiResult> {
+/**
+ * Reads an OpenAI-style server-sent-events stream. Forwards the growing "reply" text to onDelta
+ * and returns the full raw model output once the stream ends.
+ */
+async function readStream(res: Response, onDelta: (text: string) => void): Promise<string> {
+  if (!res.body) throw new AiError('AI response had no body', true);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const extractor = new ReplyExtractor();
+  let pending = '';
+  let content = '';
+
+  const handleLine = (raw: string) => {
+    const line = raw.trim();
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let chunk: any;
+    try {
+      chunk = JSON.parse(data);
+    } catch {
+      return; // ignore keep-alives / partial garbage
+    }
+    const piece = chunk?.choices?.[0]?.delta?.content;
+    if (typeof piece === 'string' && piece) {
+      content += piece;
+      const text = extractor.push(piece);
+      if (text) onDelta(text);
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    pending += decoder.decode(value, { stream: true });
+    const lines = pending.split('\n');
+    pending = lines.pop() ?? '';
+    lines.forEach(handleLine);
+  }
+  if (pending) handleLine(pending);
+  return content;
+}
+
+/**
+ * Sends the conversation to the LLM and returns the parsed result.
+ * If `onDelta` is given, the reply text is streamed to it as it is generated.
+ */
+export async function extractBooking(input: ExtractInput, onDelta?: (text: string) => void): Promise<AiResult> {
   const messages = [{ role: 'system', content: buildSystemPrompt(input) }, ...input.history];
   const body = {
     model: env.AI_MODEL,
     messages,
     temperature: 0.2,
     max_tokens: 1000, // headroom: some models spend tokens on internal reasoning
+    ...(onDelta ? { stream: true } : {}),
   };
+
+  // Once text has reached the user we must not silently retry (they would see it twice)
+  let emitted = false;
+  const emit = onDelta
+    ? (text: string) => {
+        emitted = true;
+        onDelta(text);
+      }
+    : undefined;
 
   let lastError: AiError = new AiError('AI request failed');
 
@@ -166,16 +224,24 @@ export async function extractBooking(input: ExtractInput): Promise<AiResult> {
         throw new AiError(`AI provider HTTP ${res.status}: ${detail}`, retryable);
       }
 
-      responsePayload = await res.json();
-      const content = (responsePayload as any)?.choices?.[0]?.message?.content;
-      if (typeof content !== 'string') throw new AiError('AI response had no content');
+      let content: unknown;
+      if (emit) {
+        content = await readStream(res, emit);
+        responsePayload = { streamed: true, content };
+      } else {
+        responsePayload = await res.json();
+        content = (responsePayload as any)?.choices?.[0]?.message?.content;
+      }
+      if (typeof content !== 'string' || !content) throw new AiError('AI response had no content');
 
       const result = parseModelJson(content);
       await logAiCall({ ...input, request: messages, response: responsePayload, latencyMs: Date.now() - started, success: true });
       return result;
     } catch (err: any) {
       const aiErr =
-        err instanceof AiError ? err : new AiError(err?.name === 'AbortError' ? 'AI request timed out' : 'Network error calling AI provider', true);
+        err instanceof AiError
+          ? err
+          : new AiError(err?.name === 'AbortError' ? 'AI request timed out' : 'Network error calling AI provider', true);
       lastError = aiErr;
       await logAiCall({
         ...input,
@@ -185,7 +251,7 @@ export async function extractBooking(input: ExtractInput): Promise<AiResult> {
         success: false,
         error: aiErr.message,
       });
-      if (!aiErr.retryable || attempt === MAX_ATTEMPTS) break;
+      if (!aiErr.retryable || emitted || attempt === MAX_ATTEMPTS) break;
       await sleep(1500);
     } finally {
       clearTimeout(timer);

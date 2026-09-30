@@ -151,3 +151,39 @@ textarea { resize: vertical; }
 .reschedule-form .field-row { gap: 10px; }
 .reschedule-form .alert { margin-bottom: 10px; }
 .reschedule-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ---------- streaming ---------- */
+.msg.streaming::after {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 1em;
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  background: var(--primary);
+  opacity: 0.6;
+  animation: blink 1s steps(2, start) infinite;
+}
+@keyframes blink { to { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .msg.streaming::after { animation: none; } }
+
+/* ---------- tabs, tables, roles ---------- */
+.tabs { display: flex; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+.tab { font: inherit; font-weight: 600; background: none; border: none; padding: 10px 14px; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--primary-dark); border-bottom-color: var(--primary); }
+
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; flex-shrink: 0; }
+.segmented button { font: inherit; font-size: 0.85rem; font-weight: 600; background: #fff; border: none; padding: 6px 12px; color: var(--muted); cursor: pointer; }
+.segmented button + button { border-left: 1px solid var(--border); }
+.segmented button.active { background: var(--primary-soft); color: var(--primary-dark); }
+
+.table-wrap { overflow-x: auto; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+.data-table th { text-align: left; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.data-table td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.data-table tr:last-child td { border-bottom: none; }
+.data-table .right { text-align: right; white-space: nowrap; }
+
+.role-select { width: auto; padding: 6px 10px; }
+.role-pill { margin-left: 8px; font-size: 0.7rem; font-weight: 700; text-transform: capitalize; padding: 2px 8px; border-radius: 999px; background: var(--primary-soft); color: var(--primary-dark); }

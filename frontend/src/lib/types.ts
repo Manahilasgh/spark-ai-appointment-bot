@@ -62,3 +62,18 @@ export interface SessionView {
   session: { id: string; status: string; draft: Draft; action: ChatAction; missing: string[]; readyToConfirm: boolean };
   messages: StoredMessage[];
 }
+
+export type Role = 'customer' | 'staff' | 'admin';
+
+/** An appointment as seen by staff: includes who booked it. */
+export interface StaffAppointment extends Appointment {
+  customer: { name: string; email: string };
+}
+
+export interface TeamUser {
+  id: string;
+  email: string;
+  fullName: string;
+  role: Role;
+  createdAt: string;
+}
