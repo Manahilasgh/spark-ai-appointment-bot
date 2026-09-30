@@ -2,6 +2,7 @@
 
 import { FormEvent, useMemo, useState } from 'react';
 import { api, ApiError } from '@/lib/api';
+import { buildSlots, label12 } from '@/lib/slots';
 import type { Appointment, BookingOptions, Draft } from '@/lib/types';
 
 interface Props {
@@ -10,21 +11,6 @@ interface Props {
   sessionId?: string | null; // links the appointment to the chat it came from
   onCreated: (a: Appointment) => void;
   onCancel?: () => void;
-}
-
-const toMin = (t: string) => Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
-const pad = (n: number) => String(n).padStart(2, '0');
-const label12 = (t: string) => {
-  const h = Number(t.slice(0, 2));
-  return `${((h + 11) % 12) + 1}:${t.slice(3, 5)} ${h >= 12 ? 'PM' : 'AM'}`;
-};
-
-function buildSlots({ open, close, slotMinutes }: BookingOptions['hours']): string[] {
-  const out: string[] = [];
-  for (let m = toMin(open); m + slotMinutes <= toMin(close); m += slotMinutes) {
-    out.push(`${pad(Math.floor(m / 60))}:${pad(m % 60)}`);
-  }
-  return out;
 }
 
 export default function AppointmentForm({ options, initial, sessionId, onCreated, onCancel }: Props) {

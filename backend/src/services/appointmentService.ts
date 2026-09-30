@@ -66,6 +66,33 @@ export async function cancelAppointment(actor: Actor, id: string) {
   return toApi(rows[0]);
 }
 
+/** Moves an upcoming appointment to a new date/time (same duration). */
+export async function rescheduleAppointment(actor: Actor, id: string, input: { date: string; time: string }) {
+  const { rows: current } = await pool.query(
+    'SELECT starts_at, ends_at, status FROM appointments WHERE id = $1 AND user_id = $2',
+    [id, actor.id],
+  );
+  const appt = current[0];
+  if (!appt) throw new AppError(404, 'NOT_FOUND', 'Appointment not found');
+  if (!['pending', 'confirmed'].includes(appt.status) || (appt.ends_at as Date).getTime() < Date.now()) {
+    throw new AppError(409, 'NOT_RESCHEDULABLE', 'This appointment can no longer be changed.');
+  }
+
+  const business = await getBusiness(actor.businessId);
+  const durationMin = Math.round(((appt.ends_at as Date).getTime() - (appt.starts_at as Date).getTime()) / 60_000);
+  const { startsAt, endsAt } = buildSlot(input.date, input.time, business.timezone, durationMin);
+
+  // The exclusion constraint rejects overlaps with OTHER bookings (-> 409 SLOT_TAKEN in errorHandler).
+  const { rows } = await pool.query(
+    `UPDATE appointments SET starts_at = $3, ends_at = $4
+     WHERE id = $1 AND user_id = $2 AND status IN ('pending', 'confirmed')
+     RETURNING ${COLUMNS}`,
+    [id, actor.id, startsAt, endsAt],
+  );
+  if (!rows[0]) throw new AppError(409, 'NOT_RESCHEDULABLE', 'This appointment can no longer be changed.');
+  return toApi(rows[0]);
+}
+
 export async function isSlotFree(businessId: string, startsAt: Date, endsAt: Date): Promise<boolean> {
   const { rowCount } = await pool.query(
     `SELECT 1 FROM appointments

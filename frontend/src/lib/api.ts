@@ -60,6 +60,8 @@ export const api = {
   listAppointments: () => request<{ appointments: Appointment[] }>('/api/appointments'),
   createAppointment: (b: { service: string; date: string; time: string; notes?: string; sessionId?: string }) =>
     request<{ appointment: Appointment }>('/api/appointments', { method: 'POST', body: b }),
+  rescheduleAppointment: (id: string, b: { date: string; time: string }) =>
+    request<{ appointment: Appointment }>(`/api/appointments/${id}`, { method: 'PATCH', body: b }),
   cancelAppointment: (id: string) =>
     request<{ appointment: Appointment }>(`/api/appointments/${id}/cancel`, { method: 'PATCH' }),
 

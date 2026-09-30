@@ -24,6 +24,8 @@ export const createAppointmentSchema = z.object({
   sessionId: z.string().uuid().optional(), // set when the form is the fallback for a chat
 });
 
+export const rescheduleAppointmentSchema = z.object({ date, time });
+
 export const listAppointmentsQuery = z.object({
   status: z.enum(['pending', 'confirmed', 'cancelled', 'completed']).optional(),
 });

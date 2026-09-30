@@ -1,11 +1,11 @@
 import { Router } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { validate } from '../middleware/validate';
-import { createAppointmentSchema, idParam, listAppointmentsQuery } from '../schemas';
+import { createAppointmentSchema, idParam, listAppointmentsQuery, rescheduleAppointmentSchema } from '../schemas';
 import * as appointments from '../services/appointmentService';
 import { BUSINESS_HOURS, SERVICES } from '../services/bookingRules';
-import { asyncHandler } from '../utils/asyncHandler';
 import { getBusiness } from '../services/businessService';
+import { asyncHandler } from '../utils/asyncHandler';
 
 export const appointmentsRouter = Router();
 appointmentsRouter.use(requireAuth);
@@ -34,6 +34,15 @@ appointmentsRouter.post(
   validate({ body: createAppointmentSchema }),
   asyncHandler(async (req, res) => {
     res.status(201).json({ appointment: await appointments.createAppointment(req.user!, req.body, 'form') });
+  }),
+);
+
+// Change the date/time of an existing appointment
+appointmentsRouter.patch(
+  '/:id',
+  validate({ params: idParam, body: rescheduleAppointmentSchema }),
+  asyncHandler(async (req, res) => {
+    res.json({ appointment: await appointments.rescheduleAppointment(req.user!, req.params.id, req.body) });
   }),
 );
 

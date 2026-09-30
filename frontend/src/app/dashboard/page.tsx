@@ -43,6 +43,11 @@ export default function DashboardPage() {
     await loadAppointments();
   }
 
+  async function rescheduleAppointment(id: string, values: { date: string; time: string }) {
+    await api.rescheduleAppointment(id, values);
+    await loadAppointments();
+  }
+
   if (loading || !user) {
     return <div className="center-screen"><span className="spinner" aria-label="Loading" /></div>;
   }
@@ -66,8 +71,9 @@ export default function DashboardPage() {
             appointments={appointments}
             loading={listLoading}
             error={listError}
-            timezone={options.timezone}
+            options={options}
             onCancel={cancelAppointment}
+            onReschedule={rescheduleAppointment}
             onRetry={loadAppointments}
           />
         </div>
