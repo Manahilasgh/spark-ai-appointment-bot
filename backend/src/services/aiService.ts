@@ -39,7 +39,7 @@ interface ExtractInput {
   sessionId: string;
   businessName: string;
   timezone: string;
-  draft: Record<string, unknown>;
+  draft: object;
   history: ChatTurn[];
 }
 
