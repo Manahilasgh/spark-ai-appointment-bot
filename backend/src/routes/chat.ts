@@ -27,11 +27,12 @@ chatRouter.get(
   }),
 );
 
-// The user explicitly confirms the drafted booking
+// The user explicitly confirms the drafted action (book, reschedule or cancel)
 chatRouter.post(
   '/sessions/:id/confirm',
   validate({ params: idParam }),
   asyncHandler(async (req, res) => {
-    res.status(201).json({ appointment: await chat.confirmBooking(req.user!, req.params.id) });
+    const result = await chat.confirmBooking(req.user!, req.params.id);
+    res.status(result.action === 'book' ? 201 : 200).json(result);
   }),
 );

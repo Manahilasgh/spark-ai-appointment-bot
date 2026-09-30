@@ -93,13 +93,33 @@ export async function rescheduleAppointment(actor: Actor, id: string, input: { d
   return toApi(rows[0]);
 }
 
-export async function isSlotFree(businessId: string, startsAt: Date, endsAt: Date): Promise<boolean> {
+/** `excludeId` lets an appointment being rescheduled ignore its own current slot. */
+export async function isSlotFree(businessId: string, startsAt: Date, endsAt: Date, excludeId?: string): Promise<boolean> {
   const { rowCount } = await pool.query(
     `SELECT 1 FROM appointments
      WHERE business_id = $1 AND status <> 'cancelled'
        AND tstzrange(starts_at, ends_at) && tstzrange($2::timestamptz, $3::timestamptz)
+       AND ($4::uuid IS NULL OR id <> $4::uuid)
      LIMIT 1`,
-    [businessId, startsAt, endsAt],
+    [businessId, startsAt, endsAt, excludeId ?? null],
   );
   return rowCount === 0;
+}
+
+export interface UpcomingAppointment {
+  id: string;
+  service: string;
+  startsAt: Date;
+  endsAt: Date;
+}
+
+/** The user's future, still-active appointments (soonest first). Used so the chat can refer to them. */
+export async function listUpcoming(actor: Actor, limit = 10): Promise<UpcomingAppointment[]> {
+  const { rows } = await pool.query(
+    `SELECT id, service, starts_at, ends_at FROM appointments
+     WHERE user_id = $1 AND status IN ('pending', 'confirmed') AND ends_at > now()
+     ORDER BY starts_at ASC LIMIT $2`,
+    [actor.id, limit],
+  );
+  return rows.map((r) => ({ id: r.id, service: r.service, startsAt: r.starts_at, endsAt: r.ends_at }));
 }

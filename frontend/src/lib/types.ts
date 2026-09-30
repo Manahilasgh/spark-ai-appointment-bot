@@ -7,7 +7,11 @@ export interface User {
   businessId: string;
 }
 
+export type ChatAction = 'book' | 'cancel' | 'reschedule';
+
 export interface Draft {
+  action?: ChatAction;
+  appointmentId?: string;
   service?: string;
   date?: string;
   time?: string;
@@ -40,6 +44,7 @@ export interface ChatReply {
   sessionId: string;
   reply: string;
   draft: Draft;
+  action: ChatAction;
   missing: string[];
   readyToConfirm: boolean;
   summary: string | null;
@@ -54,6 +59,6 @@ export interface StoredMessage {
 }
 
 export interface SessionView {
-  session: { id: string; status: string; draft: Draft; missing: string[]; readyToConfirm: boolean };
+  session: { id: string; status: string; draft: Draft; action: ChatAction; missing: string[]; readyToConfirm: boolean };
   messages: StoredMessage[];
 }

@@ -2,7 +2,7 @@
 
 import { KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '@/lib/api';
-import type { Appointment, BookingOptions, Draft } from '@/lib/types';
+import type { Appointment, BookingOptions, ChatAction, Draft } from '@/lib/types';
 import AppointmentForm from './AppointmentForm';
 
 interface Msg {
@@ -17,9 +17,20 @@ const uid = () => Math.random().toString(36).slice(2);
 const GREETING: Msg = {
   id: 'greeting',
   role: 'assistant',
-  content: "Hi! I can book your appointment. Tell me what you need, for example: 'Book a check-up tomorrow at 3pm'.",
+  content:
+    "Hi! I can book, reschedule or cancel appointments. Tell me what you need, for example: 'Book a check-up tomorrow at 3pm'.",
 };
-const SUGGESTIONS = ['Book a check-up tomorrow at 3pm', 'I need a teeth cleaning next Monday morning', 'Consultation on Friday at 11am'];
+const SUGGESTIONS = [
+  'Book a check-up tomorrow at 3pm',
+  'I need a teeth cleaning next Monday morning',
+  'Reschedule my appointment to Friday at 11am',
+  'Cancel my next appointment',
+];
+const CONFIRM_LABEL: Record<ChatAction, string> = {
+  book: 'Confirm booking',
+  reschedule: 'Confirm new time',
+  cancel: 'Confirm cancellation',
+};
 
 export default function ChatWidget({ options, onBooked }: { options: BookingOptions; onBooked: () => void }) {
   const [messages, setMessages] = useState<Msg[]>([GREETING]);
@@ -28,6 +39,7 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
   const [sending, setSending] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [ready, setReady] = useState(false);
+  const [action, setAction] = useState<ChatAction>('book');
   const [draft, setDraft] = useState<Draft>({});
   const [showForm, setShowForm] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -40,6 +52,7 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
     window.localStorage.removeItem(SESSION_KEY);
     setSessionId(null);
     setDraft({});
+    setAction('book');
     setReady(false);
     setShowForm(false);
     setInput('');
@@ -57,6 +70,7 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
         if (session.status !== 'active') return window.localStorage.removeItem(SESSION_KEY);
         setSessionId(id);
         setDraft(session.draft ?? {});
+        setAction(session.action ?? 'book');
         setReady(session.readyToConfirm);
         setMessages([
           GREETING,
@@ -88,6 +102,7 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
       window.localStorage.setItem(SESSION_KEY, res.sessionId);
       addMsg('assistant', res.reply);
       setDraft(res.draft);
+      setAction(res.action ?? 'book');
       setReady(res.readyToConfirm);
       if (res.needsForm) setShowForm(true); // fallback: AI down or conversation not converging
     } catch (err) {
@@ -107,23 +122,38 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
     if (!sessionId || confirming) return;
     setConfirming(true);
     try {
-      const { appointment } = await api.confirmSession(sessionId);
-      finishBooking(appointment);
+      const result = await api.confirmSession(sessionId);
+      finishAction(result.action, result.appointment);
     } catch (err) {
-      addMsg('assistant', err instanceof ApiError ? err.message : 'Could not confirm the booking. Please try again.', true);
-      if (err instanceof ApiError && (err.code === 'SLOT_TAKEN' || err.code === 'INVALID_SLOT')) setReady(false);
+      addMsg('assistant', err instanceof ApiError ? err.message : 'Could not complete that. Please try again.', true);
+      if (err instanceof ApiError && ['SLOT_TAKEN', 'INVALID_SLOT', 'NOT_FOUND', 'NOT_RESCHEDULABLE'].includes(err.code)) {
+        setReady(false);
+        onBooked(); // the list may be out of date
+      }
     } finally {
       setConfirming(false);
     }
   }
 
-  function finishBooking(a: Appointment) {
+  function finishAction(kind: ChatAction, a: Appointment) {
     const when = new Date(a.startsAt).toLocaleString('en-US', {
       weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: options.timezone,
     });
-    addMsg('assistant', `You're all set: ${a.service} on ${when}. Need another appointment? Just tell me.`);
+    if (kind === 'cancel') addMsg('assistant', `Your ${a.service} appointment on ${when} has been cancelled. Anything else?`);
+    else if (kind === 'reschedule') addMsg('assistant', `Done! Your ${a.service} is now on ${when}.`);
+    else addMsg('assistant', `You're all set: ${a.service} on ${when}. Need another appointment? Just tell me.`);
     resetChat();
     onBooked();
+  }
+
+  function declineAction() {
+    if (action === 'cancel') {
+      resetChat();
+      addMsg('assistant', 'No problem, I left your appointment as it is.');
+    } else {
+      setReady(false);
+      addMsg('assistant', 'No problem. What would you like to change?');
+    }
   }
 
   function newChat() {
@@ -143,7 +173,7 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
       <div className="card-head">
         <div>
           <h2 id="chat-title">Booking assistant</h2>
-          <p className="muted small">Describe the appointment you want in your own words.</p>
+          <p className="muted small">Book, reschedule or cancel in your own words.</p>
         </div>
         <div className="head-actions">
           <button className="btn btn-ghost btn-sm" onClick={() => setShowForm((v) => !v)}>
@@ -156,13 +186,15 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
       {showForm ? (
         <div className="chat-body">
           <p className="muted small">
-            {Object.keys(draft).length > 0 ? "I've filled in what I understood so far. Please complete the rest." : 'Fill in the details below.'}
+            {draft.service || draft.date || draft.time
+              ? "I've filled in what I understood so far. Please complete the rest."
+              : 'Fill in the details below.'}
           </p>
           <AppointmentForm
             options={options}
             initial={draft}
             sessionId={sessionId}
-            onCreated={finishBooking}
+            onCreated={(a) => finishAction('book', a)}
             onCancel={() => setShowForm(false)}
           />
         </div>
@@ -190,10 +222,10 @@ export default function ChatWidget({ options, onBooked }: { options: BookingOpti
           {ready && (
             <div className="confirm-bar">
               <button className="btn btn-primary" onClick={confirm} disabled={confirming}>
-                {confirming ? 'Booking...' : 'Confirm booking'}
+                {confirming ? 'Working...' : CONFIRM_LABEL[action]}
               </button>
-              <button className="btn btn-ghost" onClick={() => { setReady(false); addMsg('assistant', 'No problem. What would you like to change?'); }} disabled={confirming}>
-                Change details
+              <button className="btn btn-ghost" onClick={declineAction} disabled={confirming}>
+                {action === 'cancel' ? 'Keep it' : 'Change details'}
               </button>
             </div>
           )}

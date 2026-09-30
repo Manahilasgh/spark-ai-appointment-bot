@@ -1,4 +1,4 @@
-import type { Appointment, BookingOptions, ChatReply, Draft, SessionView, User } from './types';
+import type { Appointment, BookingOptions, ChatAction, ChatReply, Draft, SessionView, User } from './types';
 
 const BASE = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000').replace(/\/$/, '');
 const TOKEN_KEY = 'auth_token';
@@ -69,7 +69,7 @@ export const api = {
     request<ChatReply>('/api/chat/messages', { method: 'POST', body: b }),
   getSession: (id: string) => request<SessionView>(`/api/chat/sessions/${id}`),
   confirmSession: (id: string) =>
-    request<{ appointment: Appointment }>(`/api/chat/sessions/${id}/confirm`, { method: 'POST' }),
+    request<{ action: ChatAction; appointment: Appointment }>(`/api/chat/sessions/${id}/confirm`, { method: 'POST' }),
 };
 
 export type { Draft };
