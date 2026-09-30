@@ -30,7 +30,7 @@ export async function listBusinessAppointments(actor: Actor, query: StaffAppoint
   const order = query.when === 'past' ? 'DESC' : 'ASC'; // chosen from a validated enum, never from raw input
   const { rows } = await pool.query(
     `SELECT a.id, a.service, a.starts_at, a.ends_at, a.status, a.notes, a.created_via,
-            u.full_name AS customer_name, u.email AS customer_email
+            u.full_name AS customer_name, u.email AS customer_email, u.phone AS customer_phone
      FROM appointments a
      JOIN users u ON u.id = a.user_id
      WHERE a.business_id = $1
@@ -42,7 +42,14 @@ export async function listBusinessAppointments(actor: Actor, query: StaffAppoint
      LIMIT 200`,
     [actor.businessId, query.when, query.status ?? null],
   );
-  return rows.map((r) => ({ ...toAppointment(r), customer: { name: r.customer_name as string, email: r.customer_email as string } }));
+  return rows.map((r) => ({
+    ...toAppointment(r),
+    customer: {
+      name: r.customer_name as string,
+      email: r.customer_email as string,
+      phone: (r.customer_phone as string | null) ?? null,
+    },
+  }));
 }
 
 /** Staff can cancel any appointment in their own business (customers can only cancel their own). */

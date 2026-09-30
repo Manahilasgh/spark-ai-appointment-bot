@@ -124,7 +124,7 @@ async function streamMessage(
 }
 
 export const api = {
-  signup: (b: { fullName: string; email: string; password: string }) =>
+  signup: (b: { fullName: string; email: string; password: string; phone?: string }) =>
     request<{ user: User; token: string }>('/api/auth/signup', { method: 'POST', body: b }),
   login: (b: { email: string; password: string }) =>
     request<{ user: User; token: string }>('/api/auth/login', { method: 'POST', body: b }),

@@ -6,11 +6,23 @@ import { FormEvent, useEffect, useState } from 'react';
 import { ApiError } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 
+const PHONE_CHARS = /^\+?[\d\s()\-.]*$/;
+
+/** Mirrors the server rule in backend/src/schemas/auth.schema.ts so mistakes are caught before the round trip. */
+function phoneIssue(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return 'Enter your phone number so we can reach you.';
+  if (!PHONE_CHARS.test(trimmed)) return 'Use digits, spaces, +, -, ( ) and . only.';
+  if (trimmed.replace(/\D/g, '').length < 7) return 'Enter at least 7 digits.';
+  return null;
+}
+
 export default function AuthForm({ mode }: { mode: 'login' | 'signup' }) {
   const { user, login, signup } = useAuth();
   const router = useRouter();
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -26,9 +38,17 @@ export default function AuthForm({ mode }: { mode: 'login' | 'signup' }) {
     e.preventDefault();
     setError(null);
     setFieldErrors({});
+    if (isSignup) {
+      const issue = phoneIssue(phone);
+      if (issue) {
+        setFieldErrors({ phone: issue });
+        setError('Please fix the highlighted fields.');
+        return;
+      }
+    }
     setSubmitting(true);
     try {
-      if (isSignup) await signup({ fullName, email, password });
+      if (isSignup) await signup({ fullName, email, password, phone: phone.trim() });
       else await login(email, password);
       router.replace('/dashboard');
     } catch (err) {
@@ -69,6 +89,23 @@ export default function AuthForm({ mode }: { mode: 'login' | 'signup' }) {
             <input id="email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required />
             {fieldErrors.email && <span className="field-error">{fieldErrors.email}</span>}
           </div>
+          {isSignup && (
+            <div className="field">
+              <label htmlFor="phone">Phone number</label>
+              <input
+                id="phone"
+                type="tel"
+                inputMode="tel"
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                autoComplete="tel"
+                placeholder="+92 300 1234567"
+                required
+              />
+              {fieldErrors.phone && <span className="field-error">{fieldErrors.phone}</span>}
+              {!fieldErrors.phone && <span className="hint">So the clinic can reach you about your appointments.</span>}
+            </div>
+          )}
           <div className="field">
             <label htmlFor="password">Password</label>
             <input

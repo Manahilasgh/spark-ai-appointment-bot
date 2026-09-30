@@ -95,6 +95,13 @@ export default function StaffAppointments({ timezone }: { timezone?: string }) {
                     <td>
                       <div>{a.customer.name}</div>
                       <div className="muted small">{a.customer.email}</div>
+                      {a.customer.phone && (
+                        <div>
+                          <a className="muted small" href={`tel:${a.customer.phone.replace(/[^+\d]/g, '')}`}>
+                            {a.customer.phone}
+                          </a>
+                        </div>
+                      )}
                     </td>
                     <td>{a.service}</td>
                     <td><span className={`badge badge-${a.status}`}>{a.status}</span></td>
