@@ -18,19 +18,25 @@ Customer (chat / form) ──► Express API ──► PostgreSQL
 
 - [Features](#features)
 - [Tech stack](#tech-stack)
+- [High-level architecture](#high-level-architecture)
 - [Repository layout](#repository-layout)
 - [Data model](#data-model)
-- [Getting started](#getting-started)
+- [Running the project locally](#running-the-project-locally)
 - [Environment variables](#environment-variables)
 - [Scripts](#scripts)
 - [API reference](#api-reference)
 - [Booking rules](#booking-rules)
 - [How the AI chat works](#how-the-ai-chat-works)
+- [Key design decisions and tradeoffs](#key-design-decisions-and-tradeoffs)
 - [Frontend guide](#frontend-guide)
 - [Roles and permissions](#roles-and-permissions)
 - [Security notes](#security-notes)
+- [Deployment](#deployment)
+- [Assumptions and known limitations](#assumptions-and-known-limitations)
 - [Troubleshooting](#troubleshooting)
+- [Verification checklist](#verification-checklist)
 - [Roadmap](#roadmap)
+- [Project status](#project-status)
 
 ---
 
@@ -77,6 +83,121 @@ Customer (chat / form) ──► Express API ──► PostgreSQL
 | Streaming | Server-sent events | LLM → API → browser |
 | Logging | pino / pino-http | Pretty in dev, JSON in production, `Authorization` header redacted |
 | Hardening | helmet, cors, express-rate-limit | Three rate-limit tiers (per IP and per user) |
+
+---
+
+## High-level architecture
+
+Two deployables and two external services. The API is **stateless** (the JWT plus the database hold all
+state), so it can be scaled horizontally or deployed as a serverless handler.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Browser — Next.js 15 App Router (client components)         │
+│  pages ─► components ─► src/lib/api.ts (typed fetch + SSE)   │
+└───────────────────────────┬──────────────────────────────────┘
+                            │  JSON over HTTP · Authorization: Bearer <JWT>
+                            │  text/event-stream for streamed replies
+┌───────────────────────────▼──────────────────────────────────┐
+│  Express API (stateless, TypeScript)                         │
+│                                                              │
+│  app.ts      helmet · cors(allow-list) · express.json(10kb)  │
+│              pino-http access log                            │
+│  /health     DB ping  → 200 ok | 503 db_unavailable          │
+│  /api/*      generalLimiter (120/min per IP)                 │
+│              ├─ /auth         authLimiter · validate · service│
+│              ├─ /appointments requireAuth · validate · service│
+│              ├─ /chat         chatLimiter (per user) · service│
+│              ├─ /staff        requireRole('staff','admin')    │
+│              └─ /admin        requireRole('admin')            │
+│  errorHandler → one JSON error shape for every failure        │
+└─────────┬───────────────────────────────────┬────────────────┘
+          │ pg Pool (max 10)                  │ chat completions (OpenAI-compatible)
+┌─────────▼───────────────────┐   ┌───────────▼────────────────┐
+│  PostgreSQL 13+             │   │  LLM provider              │
+│  citext · btree_gist        │   │  Gemini / Mistral / Groq … │
+│  6 tables, all tenant-scoped│   │  extract-only, never writes│
+└─────────────────────────────┘   └────────────────────────────┘
+```
+
+### Backend layering
+
+Each layer has one job, and requests flow strictly downward — routes never talk to the database directly
+and services never touch `req`/`res`.
+
+```
+HTTP request
+ └─ infrastructure   helmet, cors, express.json, pino-http        (app.ts)
+     └─ /health      pool.query('SELECT 1')
+     └─ /api/*       generalLimiter → route-level limiter
+         └─ route    parse, call one service, pick the status code   (routes/*)
+             └─ guard     requireAuth (JWT)  →  requireRole (role re-read from DB)
+                 └─ validator  validate({ body, query, params }) with zod
+                     └─ service   business rules + SQL through one pool   (services/*)
+                         └─ database   constraints are the last line of defence
+                     └─ errorHandler → { error: { code, message, details? } }
+```
+
+- `routes/*` are thin: validate → call a service → choose 200/201.
+- `services/*` own the logic and ALL SQL (`appointmentService`, `chatService`, `staffService`, `authService`).
+- `bookingRules.ts` owns availability maths (services, hours, timezone → UTC) and is used by both the form
+  endpoint and the chat, so the two paths can never disagree.
+- `aiService.ts` is the only module that talks to the LLM, and it never touches appointments.
+- `schemas/*` is the contract: one zod schema per endpoint, typed with `z.infer` and shared with TypeScript.
+
+### Two request paths, one set of rules
+
+```
+POST /api/appointments                     POST /api/chat/messages(/stream)
+ (form)                                     (assistant)
+   │                                          │
+   ▼                                          ▼
+ bookingRules.buildSlot            aiService.extractBooking → LLM (extract only)
+   │                                          │  normalizeExtracted + applyIntent + business checks
+   ▼                                          ▼
+ appointmentService                chat_sessions.draft_booking (persisted state)
+   │                                          │  user clicks Confirm
+   │                                          ▼
+   │                                POST /api/chat/sessions/:id/confirm
+   ▼                                          ▼
+   └──────────────► appointmentService.createAppointment ◄──────────────┘
+                          │  INSERT … (exclusion constraint rejects overlaps)
+                          ▼
+                    appointments  ──►  GET /api/appointments        (the customer)
+                                      GET /api/staff/appointments    (staff/admin + customer phone)
+```
+
+### Chat streaming sequence
+
+```
+Browser                    API                        PostgreSQL          LLM
+  │ POST /chat/messages/stream │                            │               │
+  ├───────────────────────────►│  load session + draft + last 12 messages
+  │                            ├───────────────────────────►│               │
+  │                            │◄───────────────────────────┤  + next 10 upcoming appts
+  │                            ├── stream chat completions ─────────────────►│
+  │◄── data: {delta, text} ────┤◄── tokens (ReplyExtractor pulls "reply" text) │
+  │◄── data: {final, …} ───────┤  validate JSON, business checks, persist     │
+  │  user clicks "Confirm booking"                            │               │
+  ├───────────────────────────►│  INSERT INTO appointments ─►│               │
+  │◄── 201 { appointment } ────┤◄───────────────────────────┤               │
+```
+
+### Trust boundaries (defence in depth)
+
+| Boundary | What is untrusted | How it is handled |
+| --- | --- | --- |
+| Browser → API | All request input | zod schema per endpoint; JSON body capped at 10 kB; rate limits; JWT signature check |
+| LLM → API | The model's JSON (it can hallucinate or return prose) | Parsed and zod-validated; values coerced against the real service list / date / `HH:mm` formats, or dropped; anything missing is re-asked |
+| API → database | Racing requests, bad clocks, bad ranges | FK + CHECK constraints, `chk_time_order`, and the `EXCLUDE USING gist` overlap guard (→ 409) |
+| Token → role | A stale or forged role claim | `requireRole` re-reads the role from the database on every request |
+
+### Multi-tenancy
+
+`business_id` is on every tenant-owned table (`users`, `chat_sessions`, `appointments`, `ai_logs`) and every
+query filters by the caller's business scope. New signups are attached to `DEFAULT_BUSINESS_ID`. Row-Level
+Security is **not** enabled, so tenant isolation currently depends on query discipline — see
+[Assumptions and known limitations](#assumptions-and-known-limitations).
 
 ---
 
@@ -154,7 +275,35 @@ signup form, then promote that account to staff/admin (see [Roles and permission
 
 ---
 
-## Getting started
+## Running the project locally
+
+Three things run side by side: PostgreSQL, the API on `:4000`, and the web app on `:3000`.
+
+### Quickstart
+
+```bash
+# 1) database (once) — creates the tables, indexes, triggers and sample rows
+psql "$DATABASE_URL" -f db/schema.sql
+
+# 2) API — terminal 1
+cd backend
+npm install
+cp .env.example .env          # then fill in DATABASE_URL, JWT_SECRET and the AI_* values
+npm run dev                   # → http://localhost:4000
+
+# 3) web app — terminal 2
+cd frontend
+npm install
+echo "NEXT_PUBLIC_API_URL=http://localhost:4000" > .env.local
+npm run dev                   # → http://localhost:3000
+```
+
+Windows PowerShell equivalents for steps 2–3:
+
+```powershell
+cd backend;  npm install; Copy-Item .env.example .env; npm run dev      # terminal 1
+cd frontend; npm install; Set-Content .env.local 'NEXT_PUBLIC_API_URL=http://localhost:4000' -Encoding utf8; npm run dev   # terminal 2
+```
 
 ### Prerequisites
 
@@ -188,9 +337,9 @@ Check it is alive and can reach the database:
 curl http://localhost:4000/health      # {"status":"ok"}   (503 {"status":"db_unavailable"} if PG is down)
 ```
 
-> **Heads-up:** `backend/.env.example` still lists the older `MISTRAL_API_KEY` / `MISTRAL_MODEL` names.
-> `src/config/env.ts` expects the `AI_*` names documented below — copy the list from there, not from the
-> example file, until it is refreshed.
+> **Heads-up on `AI_MODEL`:** `backend/.env.example` matches the variable names below, but it ships
+> `AI_MODEL=your-model` as a placeholder. Replace it with a real model id from your provider — the code
+> default (`gemini-3.8-flash`, used only when the variable is absent) is a placeholder too.
 
 ### 3. Frontend
 
@@ -210,6 +359,40 @@ in `businesses` (the schema seeds `11111111-1111-1111-1111-111111111111`).
 1. On the dashboard, ask the assistant: `book a teeth cleaning tomorrow at 3pm`.
 2. It replies with a summary and a **Confirm booking** button — click it.
 3. Switch to **All appointments** (staff/admin) to see the customer's name, email and phone.
+
+### Ports and processes
+
+| Process | Default port | Started by | How to check it |
+| --- | --- | --- | --- |
+| PostgreSQL | 5432 (or your provider's) | local service / hosted provider | `psql "$DATABASE_URL" -c 'select 1'` |
+| API | `4000` (`PORT`) | `npm run dev` in `backend/` | `curl http://localhost:4000/health` → `{"status":"ok"}` |
+| Web app | `3000` | `npm run dev` in `frontend/` | open <http://localhost:3000> |
+
+Two terminals are required because both dev servers are long-running. If Next.js reports that port 3000 is
+in use and silently starts on 3001, the app will still call `NEXT_PUBLIC_API_URL` and the API's `CORS_ORIGIN`
+will reject it — stop the stray process instead of letting it switch ports:
+
+```powershell
+# Windows: free a port (example: 3000)
+Get-NetTCPConnection -LocalPort 3000 -State Listen |
+  ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+```
+
+```bash
+# macOS/Linux
+lsof -ti:3000 | xargs kill
+```
+
+### Everyday commands
+
+| Task | Command |
+| --- | --- |
+| Type-check the API without running it | `cd backend` then `npm run typecheck` |
+| Rebuild after changing `.env` | Ctrl+C, then `npm run dev` again — env is read at boot |
+| Reset the dev cache (fixes most "page 500 / unstyled" issues) | stop dev, `Remove-Item frontend\.next -Recurse -Force`, `npm run dev` |
+| Apply a schema change to a fresh database | `psql "$DATABASE_URL" -f db/schema.sql` |
+| Promote your account to staff/admin | `UPDATE users SET role = 'admin' WHERE email = 'you@example.com';` |
+| Give yourself a test booking | `POST /api/appointments` (see the API examples above) |
 
 ---
 
@@ -471,6 +654,130 @@ never break the chat.
 
 ---
 
+## Key design decisions and tradeoffs
+
+**1. The LLM only extracts; deterministic code decides.**
+The model turns free text into `{ intent, service, date, time }` and writes a friendly sentence — nothing
+more. Hours, slot length, availability and the write itself live in `bookingRules.ts` and
+`appointmentService.ts`.
+*Why:* LLM output is probabilistic, and a hallucinated slot is a real double-booking.
+*Trade-off:* more code to maintain, and the assistant occasionally sounds blunter ("that time is already
+taken") than a pure-LLM agent would. In exchange, business rules never need a prompt change.
+
+**2. Model output is treated as untrusted input.**
+`parseModelJson` requires strict JSON in a zod-validated shape; `normalizeExtracted` then keeps only values
+that match the real service list, an ISO date and an `HH:mm` time; `applyIntent` drops any appointment
+reference that does not resolve to one of the user's appointments.
+*Why:* a prompt injection or a rambling model must not be able to invent a service or an arbitrary id.
+*Trade-off:* legitimate but unusual phrasing is discarded and re-asked rather than accepted.
+
+**3. Nothing is written without an explicit user confirmation.**
+The chat can only reach `readyToConfirm`; the `INSERT`/`UPDATE` happens in
+`POST /api/chat/sessions/:id/confirm`, which re-checks that the session is active and the draft complete.
+*Why:* an irreversible booking action should be attributable to the human, not to a token stream.
+*Trade-off:* one extra click, and the client must hold/restore the confirm state (it does, via the persisted
+draft).
+
+**4. Conversation state lives in the database, not in the prompt.**
+`chat_sessions.draft_booking` (JSONB) is the assistant's memory; history is trimmed to the last 12 messages.
+*Why:* it survives a reload and a new HTTP request, keeps token usage bounded, and makes the flow debuggable
+with SQL.
+*Trade-off:* extra reads/writes per turn, and the draft is a second source of truth that must stay in sync
+with what the UI shows.
+
+**5. Double-booking is prevented by the database.**
+`appointments` carries `EXCLUDE USING gist (business_id WITH =, tstzrange(starts_at, ends_at) WITH &&)
+WHERE status <> 'cancelled'`. A racing request gets SQLSTATE `23P01`, mapped to `409 SLOT_TAKEN`.
+*Why:* a check-then-insert in application code loses the race; this cannot.
+*Trade-off:* it needs the `btree_gist` extension, and the constraint models **one bookable resource per
+business** — a second chair or dentist means adding `resource_id` to it.
+
+**6. Timezone maths is explicit, with no date library.**
+`bookingRules.zonedTimeToUtc` uses `Intl.DateTimeFormat` to find a zone's offset and converts a wall-clock
+date + time into a UTC instant; everything is stored as `TIMESTAMPTZ`.
+*Why:* "tomorrow at 3pm" must mean the clinic's 3pm, and the browser's clock is not authoritative.
+*Trade-off:* ~30 lines of offset arithmetic to maintain instead of an npm dependency; it assumes
+`businesses.timezone` holds a valid IANA zone.
+
+**7. The service catalogue and opening hours are typed constants.**
+`SERVICES` and `BUSINESS_HOURS` are exported from `bookingRules.ts`, enforced with `z.enum(SERVICES)` and
+served to the UI through `GET /api/appointments/options`.
+*Why:* one source of truth shared by the form, the chat, API validation and the UI — and changing hours is a
+one-line, type-checked change.
+*Trade-off:* changing them needs a deploy, and a business cannot self-serve its own hours or services (DB
+tables would be the next step).
+
+**8. Cancellation is a status change, never a delete.**
+`status = 'cancelled'` on `pending`/`confirmed` rows; no `DELETE FROM` exists anywhere in the API.
+*Why:* cancelled slots must become bookable again (which is exactly why the exclusion constraint ignores
+cancelled rows) while the clinic keeps the history.
+*Trade-off:* tables grow forever, and there is no un-cancel endpoint and no reschedule audit trail.
+
+**9. Auth is a 7-day JWT in `localStorage`, with no refresh token.**
+`requireAuth` verifies the signature; the frontend clears the token on logout and on any `401`
+(via the `auth:expired` event).
+*Why:* very few moving parts, and it works cleanly with `fetch` and SSE.
+*Trade-off:* a token cannot be revoked before it expires (logout is client-side only), and `localStorage` is
+readable by injected scripts — an httpOnly cookie with CSRF protection is the hardening step.
+
+**10. Roles are re-read from the database on every request.**
+`requireRole` queries `users.role` instead of trusting the JWT claim.
+*Why:* promoting a colleague to staff takes effect on their next click, not in seven days, and a demotion is
+immediate.
+*Trade-off:* one extra query per role-gated request.
+
+**11. One booking service, two entry points.**
+The form (`POST /api/appointments`) and the chat confirmation both call the same
+`createAppointment` / `rescheduleAppointment` / `cancelAppointment` functions.
+*Why:* the two paths cannot drift apart in validation or behaviour.
+*Trade-off:* the chat cannot take a shortcut even when the model is confident.
+
+**12. Streaming is an optimisation with a non-streaming twin.**
+`POST /api/chat/messages` returns complete JSON; `/messages/stream` returns SSE (`delta` events, then a
+`final` event). `ReplyExtractor` pulls the `reply` text out of the still-arriving JSON so words appear
+immediately.
+*Why:* perceived latency is the main UX cost of a slow model, and the JSON endpoint stays as the simple path.
+Retries stop once text has been sent so the user never sees a duplicated reply.
+*Trade-off:* two endpoints to keep in sync, a bespoke partial-JSON parser, and proxies or serverless cold
+starts must not buffer the response.
+
+**13. Validation at the edge with a single error shape.**
+One zod schema per endpoint; failures return
+`{ error: { code: 'VALIDATION_ERROR', details: [{ path, message }] } }`, and the UI maps `details[].path`
+onto the matching form field.
+*Why:* identical error handling on every endpoint, with a generic form-error mechanism and no per-form
+plumbing.
+*Trade-off:* the schema paths must match the client's field names (e.g. `phone`) for field highlighting, and
+there is no generated OpenAPI document.
+
+**14. Rate limiting is in-process.**
+Three `express-rate-limit` tiers using the default memory store.
+*Why:* no extra infrastructure, and it caps LLM spend per user as well as per IP.
+*Trade-off:* counters reset on restart and are per instance — two API instances would allow double the
+traffic; production would switch to the Redis store.
+
+**15. Every LLM call is logged in full.**
+`ai_logs` stores the model, prompt, raw response, latency, success flag and error.
+*Why:* the fastest way to debug a parse/prompt failure, and it gives prompt-iteration analytics.
+*Trade-off:* it grows without bound and contains raw conversation text, so it is PII-sensitive and needs a
+retention policy before production.
+
+**16. The phone number is required in the form but optional in the API.**
+`POST /api/auth/signup` accepts `phone`, validates it when present, and normalises a blank value to `NULL`.
+*Why:* staff need a reachable number, but making it mandatory server-side would break existing clients; the
+signup form enforces it for new users.
+*Trade-off:* API clients can still create accounts without a phone (the staff list then shows none), and
+accounts created before this change are not backfilled.
+
+**17. Small frontend dependency surface.**
+Plain `fetch` wrappers in `src/lib/api.ts`, React context for auth, hand-written CSS, no data-fetching or UI
+library.
+*Why:* nothing extra to learn, fast installs, and nothing to keep upgrading at this scope.
+*Trade-off:* caching, retries and optimistic updates are manual — each component tracks its own
+loading/error state — and CSS is maintained by hand rather than with utility classes or components.
+
+---
+
 ## Frontend guide
 
 ### Routes
@@ -582,6 +889,78 @@ If you put the API behind nginx or a similar proxy, keep buffering **off** for
 
 ---
 
+## Assumptions and known limitations
+
+This project is built to a specific, simple clinic model. The list below is deliberately explicit so the
+gap between "works in the demo" and "production-ready for any clinic" is obvious.
+
+### Assumptions
+
+- **One bookable resource per business.** The overlap guard is per `business_id`, so it models a single chair
+  / single practitioner. Two parallel calendars need `resource_id` in the exclusion constraint.
+- **Uniform opening hours, every day.** `09:00–18:00` in `bookingRules.ts`, with no weekends-off, holidays,
+  closures or lunch breaks, and no per-service duration (everything is 30 minutes by default).
+- **A fixed service catalogue** (`Teeth cleaning`, `Check-up`, `Filling`, `Consultation`).
+- **Every user belongs to exactly one business,** and new signups land in `DEFAULT_BUSINESS_ID`. There is no
+  invitation, tenant-selection or self-serve onboarding flow.
+- **Email is globally unique** (`CITEXT` across tenants), which keeps login single-step but means the same
+  email cannot exist in two businesses.
+- **The business timezone is the source of truth** (`businesses.timezone`), not the browser's clock or
+  timezone, for validating "today", opening hours and displayed slots.
+- **Users are reachable by phone.** A number is stored as typed (no E.164 normalisation or carrier
+  validation) and is optional at the database level.
+- **The LLM provider speaks the OpenAI chat-completions API** and returns JSON that usually matches the
+  requested shape; the code degrades gracefully when it does not, but it cannot fix a wrong model or key.
+- **One API instance at a time,** with a pg pool of 10 connections — fine for development and demo traffic,
+  and the reason the rate limiter uses an in-process store.
+- **A modern browser** with `fetch` streaming (`ReadableStream`) support; the code shows a clear error
+  instead of silently failing when that is missing.
+- **Configuration comes from `.env` files** (`backend/.env`, `frontend/.env.local`) — there is no secrets
+  manager or per-environment config service.
+- **PostgreSQL 13+ with permission to create the `citext` and `btree_gist` extensions.**
+
+### Known limitations
+
+- **No notifications.** Nothing emails, texts or calls anyone: no reminders, no booking confirmations, no
+  cancellation notices, no email verification. The phone number is collected for this purpose but is not
+  used for it yet.
+- **No account lifecycle features.** No password reset, no "change my details" screen (a phone number can
+  only be set at signup), and no account deletion.
+- **`appointments.status = 'completed'` is never set.** The schema allows it and the API filters accept it,
+  but no code or job ever marks a past appointment as completed — past appointments stay `confirmed` (the
+  staff "Past" view works off `ends_at <= now()`).
+- **`chat_sessions.status = 'abandoned'` is never set.** An unfinished conversation stays `active`
+  indefinitely, so abandoned sessions accumulate.
+- **Nothing is ever deleted.** There is no `DELETE FROM` anywhere in the API: cancelled appointments stay as
+  rows, and there is no way to un-cancel one. No audit trail of past reschedules either.
+- **No pagination.** Lists use hard caps instead — 50 own appointments, 200 staff appointments, 200 users,
+  200 messages per session. Older rows simply are not returned.
+- **The assistant only knows the next 10 upcoming appointments** (`listUpcoming(actor, 10)`); it cannot
+  answer questions about past bookings or totals, and it cannot resolve "my appointment" when the user has
+  more than 10 upcoming.
+- **No availability calendar.** Users see a slot dropdown generated from opening hours, not a view of
+  existing bookings, so a slot can legitimately be taken between display and submit (`409 SLOT_TAKEN`).
+- **JWTs cannot be revoked** before their 7-day expiry; logout is client-side only.
+- **Rate limits are per instance and reset on restart** (in-process store).
+- **Row-Level Security is not enabled,** so tenant isolation depends on every query remembering its
+  `business_id` scope — one missed `WHERE` would leak across tenants.
+- **No tests and no CI.** Verification is `npm run typecheck` (API) plus `npm run build` (UI) and manual
+  checks; there is no regression safety net.
+- **The schema is applied by hand** (`psql -f db/schema.sql`), with no migrations, so production changes
+  need a manual plan.
+- **`ai_logs` grows unbounded** and stores raw prompts and responses (potential PII), with no retention job.
+- **No admin UI for configuration.** Services, hours and timezone must be changed in code / SQL.
+- **Single-region assumption,** and streaming needs a proxy that does not buffer; serverless platforms may
+  need extra configuration for SSE plus a warm start.
+- **No i18n/localisation** and no formal accessibility audit (semantic tables, labels and `aria` attributes
+  are used, but screen-reader testing has not been done).
+- **Windows development caveat:** running `next build` while `next dev` is running corrupts `frontend/.next`
+  and the dev server starts returning 500s — see [Troubleshooting](#troubleshooting).
+
+The [Roadmap](#roadmap) lists the fixes for most of the above.
+
+---
+
 ## Troubleshooting
 
 **A page 500s and the dev log shows `ENOENT … .next/server/app/<route>/page.js`, or the browser says
@@ -618,7 +997,8 @@ firewall (hosted Postgres often needs an allow-list entry or `?sslmode=require`)
 
 **The API exits immediately, printing `Invalid environment configuration:` and a list of fields.**
 `src/config/env.ts` is strict by design. Add the missing variables to `backend/.env` — the list in
-[Environment variables](#environment-variables) is the source of truth (not the older `.env.example`).
+[Environment variables](#environment-variables) is the source of truth, and `backend/.env.example`
+already matches it.
 
 **`401 UNAUTHORIZED` on every request.** The token expired or was signed with a different `JWT_SECRET`
 (changing the secret invalidates existing sessions). Log in again.
@@ -665,6 +1045,45 @@ npm run build                         # UI compiles + type-checks
 Then, in the browser: sign up with a phone → book via chat → confirm → the booking appears under
 "Your appointments" → promote the account to staff → it appears in "All appointments" with the customer's
 name, email and phone.
+
+---
+
+## Roadmap
+
+Ordered roughly by value:
+
+- **Notifications** — confirmation and reminder emails/SMS. The `phone` column is already collected for this,
+  and it is the biggest gap between "demo" and "usable in a real clinic".
+- **Row-Level Security** on `business_id` so tenant isolation is enforced by the database rather than by
+  every query remembering its scope.
+- **Tests and CI** — Vitest + supertest for the API, React Testing Library for the UI, and a pipeline running
+  typecheck → tests → build on every push.
+- **Migrations** (e.g. `node-pg-migrate`) instead of applying `db/schema.sql` by hand.
+- **Multiple bookable resources** per business — add `resource_id` to the `appointments` exclusion constraint
+  and a staff calendar so a clinic can run two chairs in parallel.
+- **Availability calendar** — show existing bookings instead of a blind slot list, plus a waitlist for fully
+  booked days.
+- **Retention jobs** for `chat_messages` and `ai_logs` (and PII redaction in `ai_logs`).
+- **Pagination** on the staff/admin lists, plus a `DELETE`/archive policy for cancelled appointments.
+- **Account lifecycle** — password reset, profile editing (so an existing user can add or change their phone),
+  and account deletion.
+- **Configurable services/hours/timezone** in the database with an admin screen, instead of constants in code.
+- **Refresh tokens** (or httpOnly cookies) so sessions can be revoked, and a Redis-backed rate limiter for
+  multi-instance deployments.
+- **Mark appointments as `completed`** with a scheduled job, so the status enum is fully exercised and
+  reporting per period becomes possible.
+
+---
+
+## Project status
+
+- Built as an assessment project; the git history is the change log:
+  `85312bb` schema → `ffe93a4` API → `7f79bea` UI → `4b3b86c` reschedule + theme → `a2ea463` cancel/reschedule
+  via chat → `32dda21` streaming and schema restructuring → `f1e2d02` phone number on signup and in the
+  staff customer list → `b06ef03` this README plus a refreshed `backend/.env.example`.
+- The phone-number feature (signup field, `users.phone` persistence, and the number shown under each
+  customer's name for staff) is verified end to end against a real database.
+- No license file is included; treat the code as private unless one is added.
 
 
 
