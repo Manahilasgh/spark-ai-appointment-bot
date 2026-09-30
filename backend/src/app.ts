@@ -34,3 +34,5 @@ app.use('/api/chat', chatRouter);
 
 app.use(notFound);
 app.use(errorHandler);
+
+export default app;
